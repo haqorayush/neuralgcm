@@ -27,7 +27,9 @@ from __future__ import annotations
 import abc
 import collections
 import dataclasses
+import functools
 import itertools
+import operator
 import re
 from typing import Any, Callable, Literal, Sequence, TypeAlias
 
@@ -47,7 +49,15 @@ from neuralgcm.experimental.core import spatial_filters
 from neuralgcm.experimental.core import spherical_harmonics
 from neuralgcm.experimental.core import typing
 from neuralgcm.experimental.core import units
+import tree_math
 
+
+_SUPPORTED_BINARY_OPS = {
+    'subtract': operator.sub,
+    'divide': operator.truediv,
+    'add': operator.add,
+    'multiply': operator.mul,
+}
 
 # pylint: disable=g-classes-have-attributes
 Transform: TypeAlias = typing.Transform
@@ -126,6 +136,12 @@ COMPUTE_MASK_FNS = {
 }
 
 
+def get_partial_jnp_fn(name, **kwargs):
+  """Returns a function from jax.numpy with a given name."""
+  fn = getattr(jnp, name)  # allows specifying fiddle serializable fns.
+  return functools.partial(fn, **kwargs)
+
+
 class Identity(TransformABC):
   """Returns inputs as they are.
 
@@ -177,10 +193,12 @@ class PrescribedFields(TransformABC):
   prescribed_fields: dict[str, cx.Field]
 
   def __init__(self, prescribed_fields: dict[str, cx.Field]):
-    self.prescribed_fields = prescribed_fields
+    self.prescribed_fields = nnx.Dict(
+        {k: TransformParams(v) for k, v in prescribed_fields.items()}
+    )
 
   def __call__(self, inputs: dict[str, cx.Field]) -> dict[str, cx.Field]:
-    return self.prescribed_fields
+    return {k: v.get_value() for k, v in self.prescribed_fields.items()}
 
 
 class Broadcast(TransformABC):
@@ -682,6 +700,52 @@ class ApplyToKeys(TransformABC):
 
   def __call__(self, inputs: dict[str, cx.Field]) -> dict[str, cx.Field]:
     to_transform = SelectKeys(self.keys, self.invert)(inputs)
+    if self.include_remaining:
+      keep_as_is = {k: v for k, v in inputs.items() if k not in to_transform}
+    else:
+      keep_as_is = {}
+    return self.transform(to_transform) | keep_as_is
+
+
+@nnx_compat.dataclass
+class ApplyToFilteredKeys(TransformABC):
+  """Applies `transform` to a subset of fields matching coord or type.
+
+  Applies the given transform to fields selected by ``FilterByCoord`` and merges
+  the results with the remaining fields if `include_remaining` is True.
+
+  Args:
+    transform: The ``Transform`` to apply to the selected fields.
+    coords: A coordinate or sequence of coordinates that must be present.
+    types: A type or sequence of types that the field's coordinates must match.
+    invert: If True, apply the transform to fields that do NOT match.
+    include_remaining: If ``True``, pass through unselected fields to output.
+
+  Examples:
+    >>> import coordax as cx
+    >>> import jax.numpy as jnp
+    >>> from neuralgcm.experimental.core import transforms
+    >>> x = cx.SizedAxis('x', 3)
+    >>> inputs = {'a': cx.field(jnp.ones(3), x), 'b': cx.field(jnp.ones(2))}
+    >>> double = transforms.ScaleFields(cx.field(2.0))
+    >>> out = transforms.ApplyToFilteredKeys(double, coords=x)(inputs)
+    >>> out['a'].data[0], out['b'].data[0]
+    (Array(2., dtype=float32), Array(1., dtype=float32))
+  """
+
+  transform: Transform
+  coords: cx.Coordinate | Sequence[cx.Coordinate] | None = None
+  types: type[cx.Coordinate] | Sequence[type[cx.Coordinate]] | None = None
+  invert: bool = False
+  include_remaining: bool = True
+
+  def __post_init__(self):
+    self._filter = FilterByCoord(
+        coords=self.coords, types=self.types, invert=self.invert
+    )
+
+  def __call__(self, inputs: dict[str, cx.Field]) -> dict[str, cx.Field]:
+    to_transform = self._filter(inputs)
     if self.include_remaining:
       keep_as_is = {k: v for k, v in inputs.items() if k not in to_transform}
     else:
@@ -2101,6 +2165,98 @@ class Where(TransformABC):
     return results
 
 
+@nnx_compat.dataclass
+class EntrywiseBinaryOp(TransformABC):
+  """Applies binary operation entrywise between fields and operand fields.
+
+  Applies `op` entrywise to the pairs of Fields `inputs_transform(inputs)[key]`,
+  `operand_transform(inputs)[key]` for all keys present in the latter.
+
+  Args:
+    op: A name of a supported operator ('subtract', 'divide', 'add', 'multiply')
+      or a callable that takes two arrays and returns an array (e.g. `jnp.add`).
+    operand_transform: A transform that returns the second operand for `op`.
+    inputs_transform: Optional transform that returns the first operand.
+    include_remaining: If True, fields in `inputs` whose keys are not in
+      `operand_transform(inputs)` are passed through to the output.
+  """
+
+  op: Callable[[Any, Any], Any] | str
+  operand_transform: Transform
+  inputs_transform: Transform = Identity()
+  include_remaining: bool = False
+
+  def __call__(self, inputs: dict[str, cx.Field]) -> dict[str, cx.Field]:
+    op = (
+        _SUPPORTED_BINARY_OPS.get(self.op, self.op)
+        if isinstance(self.op, str)
+        else self.op
+    )
+    second_operand = self.operand_transform(inputs)
+    keys = second_operand.keys()
+    first_operand = {
+        k: v for k, v in self.inputs_transform(inputs).items() if k in keys
+    }
+    mapped_op = cx.cpmap(op)
+    result = {k: mapped_op(first_operand[k], second_operand[k]) for k in keys}
+    if self.include_remaining:
+      result.update({k: v for k, v in inputs.items() if k not in keys})
+    return result
+
+  @classmethod
+  def with_prescribed_fields(
+      cls,
+      op,
+      fields: dict[str, cx.Field],
+      inputs_transform: Transform = Identity(),
+      include_remaining: bool = False,
+  ):
+    return cls(
+        op=op,
+        operand_transform=PrescribedFields(fields),
+        inputs_transform=inputs_transform,
+        include_remaining=include_remaining,
+    )
+
+
+@nnx_compat.dataclass
+class ProjectOntoBasis(TransformABC):
+  """Projects inputs onto basis vectors and computes dot product.
+
+  Applies `inputs_transform` and `basis_transform` to inputs and computes their
+  dot product over `dims_to_contract`. Outputs of both transforms must have the
+  same keys. The dot product is interpreted as the sum of entry-wise products of
+  the fields. The dot product is output under the key `out_key`.
+
+  Args:
+    to_basis_transform: Transform that returns a basis fields.
+    inputs_transform: Optional transform on inputs that will be projected.
+    dims_to_contract: Sequence of dimensions to take the dot product over.
+    out_key: The key for the output field containing the dot product.
+    allow_missing: If True, ignores dimensions in `dims_to_contract` that are
+      missing from individual fields.
+  """
+
+  to_basis_transform: Transform
+  inputs_transform: Transform = Identity()
+  dims_to_contract: Sequence[str | cx.Coordinate] = ()
+  out_key: str = 'projection'
+  allow_missing: bool = True
+
+  def __call__(self, inputs: dict[str, cx.Field]) -> dict[str, cx.Field]:
+    basis_dict = self.to_basis_transform(inputs)
+    inputs_dict = self.inputs_transform(inputs)
+    tree_dot = cx.cmap(
+        lambda x, y: tree_math.numpy.dot(
+            tree_math.Vector(x), tree_math.Vector(y)
+        )
+    )
+    dims = self.dims_to_contract
+    untag_fn = lambda f: cx.untag(f, *dims, allow_missing=self.allow_missing)
+    result = tree_dot(untag_fn(inputs_dict), untag_fn(basis_dict))
+    return {self.out_key: result}
+
+
 class NestedTransform(nnx.Module, pytree=False):
   """Wrapper that applies transforms to values of a nested dict[dict[Field]].
 
@@ -2123,12 +2279,25 @@ class NestedTransform(nnx.Module, pytree=False):
   def __init__(
       self,
       transform: typing.Transform | dict[str | type(...), typing.Transform],
+      default_transform: typing.Transform | None = None,
   ):
     if isinstance(transform, dict):
       transforms_map = transform.copy()
-      self.default_transform = transforms_map.pop(..., None)
+      if ... in transforms_map:
+        if default_transform is not None:
+          raise ValueError(
+              'Cannot specify default_transform both via `...` in '
+              '`transform` dict and as a separate argument.'
+          )
+        self.default_transform = transforms_map.pop(...)
+      else:
+        self.default_transform = default_transform
       self.transforms = transforms_map
     else:
+      if default_transform is not None:
+        raise ValueError(
+            'Cannot specify default_transform when transform is not a dict.'
+        )
       self.default_transform = transform
       self.transforms = {}
 

@@ -14,6 +14,7 @@
 
 """Tests that transforms produce outputs with expected structure."""
 
+import operator
 from typing import Callable
 
 from absl.testing import absltest
@@ -23,13 +24,13 @@ import coordax as cx
 from flax import nnx
 import jax
 import jax.numpy as jnp
+import jax_datetime as jdt
 from neuralgcm.experimental.core import coordinates
 from neuralgcm.experimental.core import interpolators
 from neuralgcm.experimental.core import spatial_filters
 from neuralgcm.experimental.core import spherical_harmonics
 from neuralgcm.experimental.core import transforms
 import numpy as np
-
 
 class TransformsTest(parameterized.TestCase):
   """Tests that transforms work as expected."""
@@ -624,6 +625,46 @@ class TransformsTest(parameterized.TestCase):
         'b': inputs['b'],
     }
     chex.assert_trees_all_close(actual, expected)
+
+  def test_apply_with_filter(self):
+    x = cx.SizedAxis('x', 3)
+    y = cx.SizedAxis('y', 4)
+    inputs = {
+        'a': cx.field(np.array([1.0, 2.0, 3.0]), x),
+        'b': cx.field(np.zeros((3, 4)), x, y),
+    }
+    shift_and_norm = transforms.StandardizeFields(
+        shifts=cx.field(1.0), scales=cx.field(2.0)
+    )
+    apply_to_x_only = transforms.ApplyToFilteredKeys(
+        transform=shift_and_norm, coords=x, invert=False
+    )
+    # sle t fields that have `x` axis (i.e. both 'a' and 'b').
+    actual_all = apply_to_x_only(inputs)
+    expected_all = {
+        'a': cx.field(np.array([0.0, 0.5, 1.0]), x),
+        'b': cx.field(np.full((3, 4), -0.5), x, y),
+    }
+    chex.assert_trees_all_close(actual_all, expected_all)
+
+    # select only fields that have `y` axis (i.e. 'b').
+    apply_to_y = transforms.ApplyToFilteredKeys(transform=shift_and_norm, coords=y)
+    actual_y = apply_to_y(inputs)
+    expected_y = {
+        'a': inputs['a'],
+        'b': cx.field(np.full((3, 4), -0.5), x, y),
+    }
+    chex.assert_trees_all_close(actual_y, expected_y)
+    # with invert=True to coords=y, it should apply to 'a' only.
+    apply_not_y = transforms.ApplyToFilteredKeys(
+        transform=shift_and_norm, coords=y, invert=True
+    )
+    actual_not_y = apply_not_y(inputs)
+    expected_not_y = {
+        'a': cx.field(np.array([0.0, 0.5, 1.0]), x),
+        'b': inputs['b'],
+    }
+    chex.assert_trees_all_close(actual_not_y, expected_not_y)
 
   def test_apply_fn_to_keys(self):
     x = cx.SizedAxis('x', 3)
@@ -1458,6 +1499,89 @@ class NestedTransformTest(parameterized.TestCase):
     expected = {'a': cx.field(jnp.array([10.0, 200.0]), x)}
     chex.assert_trees_all_equal(actual, expected)
 
+  def test_elementwise_binary_op_custom_types(self):
+
+    time = jdt.Datetime.from_isoformat('1993-03-21:03:04:12')
+    dt = jdt.Timedelta.from_timedelta64(np.timedelta64(22, 'h'))
+    inputs = {'time': cx.field(time)}
+    operands = {'time': cx.field(dt)}
+
+    op_transform = transforms.EntrywiseBinaryOp.with_prescribed_fields(
+        operator.add, operands
+    )
+    actual = op_transform(inputs)
+    expected_time = time + dt
+    expected = {'time': cx.field(expected_time)}
+    chex.assert_trees_all_equal(actual, expected)
+
+  def test_elementwise_binary_op(self):
+    x = cx.SizedAxis('x', 2)
+    inputs = {
+        'a': cx.field(jnp.array([1.0, 2.0]), x),
+        'b': cx.field(jnp.array([5.0, 6.0]), x),
+        'c': cx.field(jnp.array([7.0, 8.0]), x),
+    }
+    operands = {
+        'a': cx.field(jnp.array([10.0, 11.0]), x),
+        'b': cx.field(jnp.array([12.0, 13.0]), x),
+    }
+    op_transform = transforms.EntrywiseBinaryOp.with_prescribed_fields(
+        'add', operands, include_remaining=True
+    )
+    actual = op_transform(inputs)
+    expected = {
+        'a': cx.field(jnp.array([11.0, 13.0]), x),
+        'b': cx.field(jnp.array([17.0, 19.0]), x),
+        'c': cx.field(jnp.array([7.0, 8.0]), x),
+    }
+    chex.assert_trees_all_equal(actual, expected)
+
+  def test_project_onto_basis(self):
+    x = cx.SizedAxis('x', 2)
+    y = cx.SizedAxis('y', 3)
+    inputs = {
+        'a': cx.field(jnp.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]), y, x),
+        'b': cx.field(jnp.array([-1.0, -2.0]), x),
+    }
+    basis = {
+        'a': cx.field(jnp.ones((3, 2)), y, x),
+        'b': cx.field(jnp.array([0.5, 1.0]), x),
+    }
+    # a dot basis_a over x: [3.0, 7.0, 11.0]
+    # b dot basis_b over x: -2.5 (broadcast over y -> [-2.5, -2.5, -2.5])
+    # total = [0.5, 4.5, 8.5]
+    transform = transforms.ProjectOntoBasis(
+        to_basis_transform=transforms.PrescribedFields(basis),
+        out_key='proj',
+        dims_to_contract=('x',),
+    )
+    actual = transform(inputs)
+    self.assertIn('proj', actual)
+    expected_proj = cx.field(jnp.array([0.5, 4.5, 8.5]), y)
+    chex.assert_trees_all_close(actual['proj'], expected_proj)
+
+  def test_project_onto_basis_with_missing_dims(self):
+    x = cx.SizedAxis('x', 2)
+    inputs = {
+        'a': cx.field(jnp.array([1.0, 2.0]), x),
+        'b': cx.field(10.0),  # scalar field, missing 'x' entirely
+    }
+    basis = {
+        'a': cx.field(jnp.array([0.5, 1.0]), x),
+        'b': cx.field(2.0),
+    }
+    # a dot basis_a over x: 1*0.5 + 2*1.0 = 2.5
+    # b dot basis_b over x (which doesn't exist, treats as scalar): 10*2 = 20.0
+    # total = 22.5
+    transform = transforms.ProjectOntoBasis(
+        to_basis_transform=transforms.PrescribedFields(basis),
+        out_key='proj',
+        dims_to_contract=('x',),
+        allow_missing=True,
+    )
+    actual = transform(inputs)
+    self.assertIn('proj', actual)
+    chex.assert_trees_all_close(actual['proj'], cx.field(22.5))
 
 if __name__ == '__main__':
   jax.config.update('jax_traceback_filtering', 'off')
